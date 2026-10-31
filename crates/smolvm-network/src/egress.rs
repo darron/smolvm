@@ -19,7 +19,7 @@
 //! reach. A replacement can never lift the policy: an empty list admits nothing.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -339,6 +339,63 @@ fn floor_mode() -> FloorMode {
     }
 }
 
+/// Host-only engine setting naming ONE IPv4 TCP service (`A.B.C.D:PORT`) that
+/// guests may reach through the `Strict` floor, e.g. a model proxy that injects
+/// credentials outside the sandbox. It is read from the VMM process environment
+/// (inherited from `serve`), never from a guest or an API request.
+pub const FLOOR_TCP_EXCEPTION_ENV: &str = "SMOLVM_EGRESS_FLOOR_TCP_EXCEPTION";
+
+/// Parse a [`FLOOR_TCP_EXCEPTION_ENV`] value: exactly one `A.B.C.D:PORT`, where
+/// the address is RFC 1918 private (the only floored range an exception may
+/// name: never loopback, cloud metadata, unspecified, broadcast or the gateway's
+/// CGNAT range, and a public address is not floored so needs none) and the
+/// port is nonzero. No CIDR, no list, no IPv6. Pure, so unit-testable.
+fn parse_floor_tcp_exception(value: &str) -> Result<SocketAddrV4, String> {
+    let address: SocketAddrV4 = value
+        .trim()
+        .parse()
+        .map_err(|_| format!("'{value}' is not exactly one IPv4 A.B.C.D:PORT"))?;
+    if address.port() == 0 {
+        return Err(format!("'{value}' has port 0"));
+    }
+    if !address.ip().is_private() {
+        return Err(format!(
+            "'{value}' is not an RFC 1918 private address (10/8, 172.16/12, 192.168/16)"
+        ));
+    }
+    Ok(address)
+}
+
+/// Resolve the strict-floor TCP exception from the raw environment lookup.
+/// Fails closed: an unset variable gives no exception silently, and anything
+/// invalid gives no exception with a warning, so the floor stays complete.
+fn floor_tcp_exception_from(raw: Result<String, std::env::VarError>) -> Option<SocketAddrV4> {
+    let value = match raw {
+        Err(std::env::VarError::NotPresent) => return None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                "{FLOOR_TCP_EXCEPTION_ENV} is not valid UTF-8; no strict-floor exception applies"
+            );
+            return None;
+        }
+        Ok(value) => value,
+    };
+    match parse_floor_tcp_exception(&value) {
+        Ok(address) => Some(address),
+        Err(reason) => {
+            tracing::warn!(
+                "{FLOOR_TCP_EXCEPTION_ENV} ignored: {reason}; no strict-floor exception applies"
+            );
+            None
+        }
+    }
+}
+
+/// Read once per policy, like [`floor_mode`].
+fn floor_tcp_exception() -> Option<SocketAddrV4> {
+    floor_tcp_exception_from(std::env::var(FLOOR_TCP_EXCEPTION_ENV))
+}
+
 /// The cloud-metadata link-local range (`169.254.0.0/16` / `fe80::/10`) — the
 /// one destination floored in every mode except `Off`, including via an
 /// IPv4-mapped IPv6 address so it can't be smuggled past.
@@ -410,6 +467,10 @@ pub struct EgressPolicy {
     rules: Arc<RwLock<Arc<Vec<CompiledRule>>>>,
     /// Hard-floor scope, resolved once from the deployment context at creation.
     floor: FloorMode,
+    /// The one IPv4 TCP `address:port` the `Strict` floor lets through
+    /// ([`FLOOR_TCP_EXCEPTION_ENV`]), resolved once at creation. It lifts only
+    /// the floor for that exact flow: the allow list and rules still apply.
+    floor_tcp_exception: Option<SocketAddrV4>,
     /// Audit sink for denials. When set, every denied connect/sendto/resolve is
     /// appended here in addition to the runtime's stderr line, so the record
     /// can't be evicted by ordinary connection chatter in the boot log.
@@ -478,6 +539,7 @@ impl EgressPolicy {
             inner: None,
             rules: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             floor: floor_mode(),
+            floor_tcp_exception: floor_tcp_exception(),
             denial_log: None,
             watchlist: None,
             signal_log: None,
@@ -500,6 +562,7 @@ impl EgressPolicy {
             })),
             rules: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             floor: floor_mode(),
+            floor_tcp_exception: floor_tcp_exception(),
             denial_log: None,
             watchlist: None,
             signal_log: None,
@@ -581,8 +644,22 @@ impl EgressPolicy {
         Ok(self)
     }
 
+    /// Whether this flow is exactly the strict floor's TCP exception: `Strict`
+    /// floor, TCP, the configured IPv4 address (not its IPv4-mapped IPv6 form)
+    /// and the configured port. Never true for a port-less check.
+    fn floor_excepted(&self, transport: FlowTransport, ip: IpAddr, port: Option<u16>) -> bool {
+        self.floor == FloorMode::Strict
+            && transport == FlowTransport::Tcp
+            && matches!(
+                (self.floor_tcp_exception, ip, port),
+                (Some(exception), IpAddr::V4(v4), Some(port))
+                    if *exception.ip() == v4 && exception.port() == port
+            )
+    }
+
     /// First matching rule after the platform floor. The strict floor is
-    /// absolute; local loopback needs an explicit matching static allow.
+    /// absolute, except for its one configured TCP flow; local loopback needs
+    /// an explicit matching static allow.
     pub fn rule_action(
         &self,
         transport: FlowTransport,
@@ -607,7 +684,7 @@ impl EgressPolicy {
         let rules = self.compiled_rules();
         let first = rules.iter().find(matches)?;
         let action = Some(first.action);
-        if !is_floored(ip, self.floor) {
+        if !is_floored(ip, self.floor) || self.floor_excepted(transport, ip, port) {
             return action;
         }
         if self.floor == FloorMode::Private {
@@ -638,8 +715,26 @@ impl EgressPolicy {
         match self.rule_action(transport, ip, port) {
             Some(RuleAction::Allow | RuleAction::Redirect) => true,
             Some(RuleAction::Deny) => false,
+            None if self.floor_excepted(transport, ip, port) => self.allow_list_admits(ip),
             None => self.allows(ip),
         }
+    }
+
+    /// [`Self::allows`] for a TCP dial, where the port is known: the strict
+    /// floor's TCP exception applies to that exact address and port only.
+    pub fn allows_tcp_connect(&self, address: std::net::SocketAddr) -> bool {
+        if self.floor_excepted(FlowTransport::Tcp, address.ip(), Some(address.port())) {
+            return self.allow_list_admits(address.ip());
+        }
+        self.allows(address.ip())
+    }
+
+    /// Test hook for other modules: the `Strict` floor with `exception`, as a
+    /// `serve` VMM configured through [`FLOOR_TCP_EXCEPTION_ENV`].
+    #[cfg(test)]
+    pub(crate) fn set_strict_floor_tcp_exception_for_test(&mut self, exception: SocketAddrV4) {
+        self.floor = FloorMode::Strict;
+        self.floor_tcp_exception = Some(exception);
     }
 
     /// Attach the structured decision record for a host-minted launch.
@@ -830,6 +925,7 @@ impl EgressPolicy {
             })),
             rules: self.rules.clone(),
             floor: self.floor,
+            floor_tcp_exception: self.floor_tcp_exception,
             denial_log: self.denial_log.clone(),
             watchlist: self.watchlist.clone(),
             signal_log: self.signal_log.clone(),
@@ -884,6 +980,12 @@ impl EgressPolicy {
             }
             return false;
         }
+        self.allow_list_admits(ip)
+    }
+
+    /// The allow list alone, without the floor: static CIDRs and unexpired
+    /// learned IPs, or everything when no list is set.
+    fn allow_list_admits(&self, ip: IpAddr) -> bool {
         match &self.inner {
             None => true,
             Some(list) => {
@@ -1713,5 +1815,219 @@ mod tests {
             "2606:4700::1111".parse().unwrap(),
             FloorMode::Strict
         ));
+    }
+
+    /// A `Strict` policy carrying a model-proxy exception, as a
+    /// `serve` VMM with `SMOLVM_EGRESS_FLOOR_TCP_EXCEPTION=10.0.0.142:8080`.
+    fn strict_with_exception(policy: EgressPolicy) -> EgressPolicy {
+        let mut policy = policy;
+        policy.floor = FloorMode::Strict;
+        policy.floor_tcp_exception = Some("10.0.0.142:8080".parse().unwrap());
+        policy
+    }
+
+    #[test]
+    fn floor_tcp_exception_admits_exactly_one_tcp_flow() {
+        let policy = strict_with_exception(EgressPolicy::unrestricted());
+        let tcp = |addr: &str, port: u16| {
+            policy.allows_flow(FlowTransport::Tcp, addr.parse().unwrap(), Some(port))
+        };
+        assert!(tcp("10.0.0.142", 8080), "the configured flow");
+        assert!(policy.allows_tcp_connect("10.0.0.142:8080".parse().unwrap()));
+        // Wrong port on the right address.
+        for port in [80, 443, 8079, 8081, 8082, 8317, 8443] {
+            assert!(!tcp("10.0.0.142", port), "port {port}");
+        }
+        assert!(!policy.allows_tcp_connect("10.0.0.142:8081".parse().unwrap()));
+        // Every other floored address on the right port, and the router.
+        for addr in [
+            "10.0.0.140",
+            "10.0.0.141",
+            "10.0.0.143",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "0.0.0.0",
+            "100.64.0.1",
+            "100.96.0.1",
+            "169.254.169.254",
+        ] {
+            assert!(!tcp(addr, 8080), "{addr}:8080");
+        }
+        assert!(!tcp("10.0.0.140", 8317), "the router stays denied");
+        assert!(!tcp("169.254.169.254", 80), "cloud metadata stays denied");
+        // IPv6: the mapped form of the exact address is denied (the exception
+        // names the IPv4 address only), as are the internal v6 ranges.
+        for addr in [
+            "::ffff:10.0.0.142",
+            "::ffff:169.254.169.254",
+            "fc00::1",
+            "fd00::8080",
+            "fe80::1",
+            "::1",
+            "::",
+        ] {
+            assert!(!tcp(addr, 8080), "[{addr}]:8080");
+        }
+        // Not TCP, or no port: denied.
+        let ip: IpAddr = "10.0.0.142".parse().unwrap();
+        assert!(!policy.allows_flow(FlowTransport::Udp, ip, Some(8080)));
+        assert!(!policy.allows_flow(FlowTransport::Icmp, ip, None));
+        assert!(!policy.allows_flow(FlowTransport::Tcp, ip, None));
+        assert!(!policy
+            .deny_all_datagrams()
+            .allows_flow(FlowTransport::Udp, ip, Some(8080)));
+        // Port-less checks never see the exception.
+        assert!(!policy.allows(ip));
+        assert!(!policy.allows_v4("10.0.0.142".parse().unwrap()));
+        // Public destinations are unaffected.
+        assert!(tcp("8.8.8.8", 443));
+    }
+
+    #[test]
+    fn floor_tcp_exception_lifts_only_the_floor_not_the_policy() {
+        use smolvm_protocol::{EgressRule, RuleAction};
+        let ip: IpAddr = "10.0.0.142".parse().unwrap();
+        // An allow list that does not name the address still denies it.
+        let locked = strict_with_exception(EgressPolicy::deny_all());
+        assert!(!locked.allows_flow(FlowTransport::Tcp, ip, Some(8080)));
+        assert!(!locked.allows_tcp_connect("10.0.0.142:8080".parse().unwrap()));
+        let listed = strict_with_exception(EgressPolicy::from_allowed_cidrs(Some(&[
+            "10.0.0.142/32".to_string(),
+        ])));
+        assert!(listed.allows_flow(FlowTransport::Tcp, ip, Some(8080)));
+        assert!(!listed.allows_flow(FlowTransport::Tcp, ip, Some(8081)));
+        // A deny rule still wins on the exact flow.
+        let rule = |cidr: &str, action| EgressRule {
+            transport: None,
+            cidr: Some(cidr.into()),
+            ports: None,
+            action,
+        };
+        let denied = strict_with_exception(
+            EgressPolicy::unrestricted()
+                .with_rules(&[rule("10.0.0.0/24", RuleAction::Deny)])
+                .unwrap(),
+        );
+        assert!(!denied.allows_flow(FlowTransport::Tcp, ip, Some(8080)));
+        assert_eq!(
+            denied.rule_action(FlowTransport::Tcp, ip, Some(8080)),
+            Some(RuleAction::Deny)
+        );
+        // A broad allow rule reopens nothing beyond the exact flow.
+        let broad = strict_with_exception(
+            EgressPolicy::unrestricted()
+                .with_rules(&[
+                    rule("0.0.0.0/0", RuleAction::Allow),
+                    rule("::/0", RuleAction::Allow),
+                ])
+                .unwrap(),
+        );
+        assert!(broad.allows_flow(FlowTransport::Tcp, ip, Some(8080)));
+        for (addr, port) in [
+            ("10.0.0.142", 8081),
+            ("10.0.0.141", 8080),
+            ("169.254.169.254", 80),
+            ("::ffff:10.0.0.142", 8080),
+        ] {
+            assert_eq!(
+                broad.rule_action(FlowTransport::Tcp, addr.parse().unwrap(), Some(port)),
+                Some(RuleAction::Deny),
+                "{addr}:{port}"
+            );
+        }
+        assert!(!broad.allows_flow(FlowTransport::Udp, ip, Some(8080)));
+    }
+
+    #[test]
+    fn floor_tcp_exception_applies_only_under_strict() {
+        let ip: IpAddr = "10.0.0.142".parse().unwrap();
+        let exception = Some("10.0.0.142:8080".parse().unwrap());
+        // Without a configured exception the strict floor is complete.
+        let mut plain = EgressPolicy::unrestricted();
+        plain.floor = FloorMode::Strict;
+        assert!(!plain.allows_flow(FlowTransport::Tcp, ip, Some(8080)));
+        // `--block-private` (`Private`) keeps its own explicit reopen path.
+        let mut private = EgressPolicy::unrestricted();
+        private.floor = FloorMode::Private;
+        private.floor_tcp_exception = exception;
+        assert!(!private.allows_flow(FlowTransport::Tcp, ip, Some(8080)));
+        // A strict host keeps the exception after `with_private_floor`.
+        let strict = strict_with_exception(EgressPolicy::unrestricted())
+            .with_private_floor(&[])
+            .unwrap();
+        assert!(strict.allows_flow(FlowTransport::Tcp, ip, Some(8080)));
+        assert!(!strict.allows_flow(FlowTransport::Tcp, ip, Some(8081)));
+        // The local modes never floor RFC 1918, so the exception is moot.
+        for floor in [
+            FloorMode::MetadataAndLoopback,
+            FloorMode::MetadataOnly,
+            FloorMode::Off,
+        ] {
+            let mut local = EgressPolicy::unrestricted();
+            local.floor = floor;
+            local.floor_tcp_exception = exception;
+            assert!(
+                local.allows_flow(FlowTransport::Tcp, ip, Some(8081)),
+                "{floor:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn floor_tcp_exception_parsing_fails_closed() {
+        let ok = |value: &str| parse_floor_tcp_exception(value).unwrap();
+        assert_eq!(ok("10.0.0.142:8080"), "10.0.0.142:8080".parse().unwrap());
+        assert_eq!(ok(" 10.0.0.142:8080\n"), "10.0.0.142:8080".parse().unwrap());
+        assert_eq!(ok("172.16.0.5:1"), "172.16.0.5:1".parse().unwrap());
+        assert_eq!(
+            ok("192.168.0.1:65535"),
+            "192.168.0.1:65535".parse().unwrap()
+        );
+        for bad in [
+            "",
+            "10.0.0.142",
+            "10.0.0.142:",
+            "10.0.0.142:0",
+            "10.0.0.142:65536",
+            "10.0.0.142:-1",
+            "10.0.0.142:http",
+            "10.0.0.142/32:8080",
+            "10.0.0.0/24:8080",
+            "10.0.0.142:8080,10.0.0.143:8080",
+            "10.0.0.142:8080 10.0.0.143:8080",
+            "tcp:10.0.0.142:8080",
+            "010.0.0.142:8080",
+            "10.0.0:8080",
+            "[::ffff:10.0.0.142]:8080",
+            "[fd00::1]:8080",
+            "169.254.169.254:80",
+            "127.0.0.1:8080",
+            "0.0.0.0:8080",
+            "255.255.255.255:8080",
+            "100.64.0.1:8080",
+            "100.96.0.1:8080",
+            "224.0.0.1:8080",
+            "8.8.8.8:443",
+            "codex-proxy:8080",
+        ] {
+            assert!(
+                parse_floor_tcp_exception(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+        use std::env::VarError;
+        assert_eq!(floor_tcp_exception_from(Err(VarError::NotPresent)), None);
+        assert_eq!(
+            floor_tcp_exception_from(Err(VarError::NotUnicode(std::ffi::OsString::from("x")))),
+            None
+        );
+        assert_eq!(floor_tcp_exception_from(Ok("10.0.0.142:0".into())), None);
+        assert_eq!(floor_tcp_exception_from(Ok("".into())), None);
+        assert_eq!(
+            floor_tcp_exception_from(Ok("10.0.0.142:8080".into())),
+            Some("10.0.0.142:8080".parse().unwrap())
+        );
     }
 }

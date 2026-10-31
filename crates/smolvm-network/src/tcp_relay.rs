@@ -414,7 +414,9 @@ impl TcpRelayTable {
                 binding,
                 destination,
                 direct_address: self.host_connect_addr(destination),
-                direct_allowed: self.egress.allows(self.host_connect_addr(destination).ip())
+                direct_allowed: self
+                    .egress
+                    .allows_tcp_connect(self.host_connect_addr(destination))
                     || self.is_host_service_destination(destination),
                 audit: self.egress.clone(),
             },
@@ -2109,6 +2111,59 @@ mod tests {
         // Without the deny the same flow is not refused by the rule path.
         let open = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gateway], None);
         assert!(open.destination_allowed(SocketAddr::new(gateway, 5432)));
+    }
+
+    #[test]
+    fn strict_floor_tcp_exception_gates_the_syn_and_the_dial() {
+        let mut policy = EgressPolicy::unrestricted();
+        policy.set_strict_floor_tcp_exception_for_test("10.0.0.142:8080".parse().unwrap());
+        let gateway: IpAddr = "100.96.0.1".parse().unwrap();
+        let table = TcpRelayTable::new(None, policy, vec![gateway], None);
+        let proxy: SocketAddr = "10.0.0.142:8080".parse().unwrap();
+        // The pre-handshake gate: only the exact flow gets a listen socket.
+        assert!(table.destination_allowed(proxy));
+        for denied in [
+            "10.0.0.142:8081",
+            "10.0.0.140:8317",
+            "10.0.0.141:8080",
+            "169.254.169.254:80",
+            "100.96.0.1:8080",
+            "[::ffff:10.0.0.142]:8080",
+        ] {
+            assert!(
+                !table.destination_allowed(denied.parse().unwrap()),
+                "{denied}"
+            );
+        }
+        // The host dial goes to the destination itself.
+        assert!(
+            matches!(table.outbound_target(proxy), RelayTarget::Connect(addr) if addr == proxy)
+        );
+        // Under mediation the broker may dial the exact flow directly.
+        let mediated = table.with_intercept(Some(crate::StreamInterception::Mediated(
+            crate::MediatedBinding {
+                endpoint: crate::InterceptEndpoint {
+                    addr: "127.0.0.1:43123".parse().unwrap(),
+                    token: [9; 32],
+                },
+                machine_id: [7; 16],
+                parent_id: [0; 16],
+            },
+        )));
+        assert!(matches!(
+            mediated.outbound_target(proxy),
+            RelayTarget::Mediated {
+                direct_allowed: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            mediated.outbound_target("10.0.0.142:8081".parse().unwrap()),
+            RelayTarget::Mediated {
+                direct_allowed: false,
+                ..
+            }
+        ));
     }
 
     #[test]
